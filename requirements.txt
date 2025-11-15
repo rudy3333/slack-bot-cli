@@ -1,3 +1,4 @@
 slack-bolt
 slack-cli-hooks<1.0.0
 python-dotenv
+textual
