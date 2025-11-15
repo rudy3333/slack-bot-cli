@@ -493,9 +493,32 @@ class BotCLI(TextualApp):
             self.call_from_thread(self.update_status, "Error: No channel selected", "error")
             return
         
-        self.call_from_thread(self.update_status, "Sending message...", "loading")
+        self.call_from_thread(self.update_status, "Checking channel membership...", "loading")
         
         try:
+            membership_result = self.slack_app.client.conversations_info(
+                channel=self.selected_channel_id
+            )
+            
+            is_member = membership_result.get("channel", {}).get("is_member", False)
+            
+            if not is_member:
+                self.call_from_thread(self.update_status, "Joining channel...", "loading")
+                join_result = self.slack_app.client.conversations_join(
+                    channel=self.selected_channel_id
+                )
+                
+                if not join_result["ok"]:
+                    error_msg = join_result.get('error', 'Unknown error')
+                    self.call_from_thread(
+                        self.update_status,
+                        f"Failed to join channel: {error_msg}",
+                        "error"
+                    )
+                    return
+            
+            self.call_from_thread(self.update_status, "Sending message...", "loading")
+            
             result = self.slack_app.client.chat_postMessage(
                 channel=self.selected_channel_id,
                 text=message
