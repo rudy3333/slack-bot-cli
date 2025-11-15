@@ -1,6 +1,8 @@
 
 import os
+import json
 import time
+from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -11,8 +13,12 @@ from textual.containers import Container, Vertical, ScrollableContainer
 from textual.binding import Binding
 from textual.message import Message
 from textual import work
+from formatting import parse_slack_formatting, format_user_input, resolve_mentions_in_message
 
 load_dotenv()
+
+CACHE_DIR = Path(".cache")
+CHANNELS_CACHE_FILE = CACHE_DIR / "channels.json"
 
 
 class ChannelLabel(Label):
@@ -254,6 +260,16 @@ class BotCLI(TextualApp):
         input_widget.focus()
         
         if self.initialize_slack():
+            cached_channels = self.load_channels_from_cache()
+            if cached_channels:
+                self.channels = cached_channels
+                self.filtered_channels = cached_channels[:20]
+                self.update_status(
+                    f"Loaded {len(cached_channels)} channels from cache. Refreshing...",
+                    "success"
+                )
+                self.update_suggestions("")
+            
             self.load_channels()
         else:
             self.update_status(
@@ -277,6 +293,23 @@ class BotCLI(TextualApp):
         except Exception as e:
             self.update_status(f"Error initializing Slack: {e}", "error")
             return False
+
+    def load_channels_from_cache(self) -> list[dict]:
+        try:
+            if CHANNELS_CACHE_FILE.exists():
+                with open(CHANNELS_CACHE_FILE, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            pass
+        return []
+
+    def save_channels_to_cache(self, channels: list[dict]) -> None:
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            with open(CHANNELS_CACHE_FILE, 'w') as f:
+                json.dump(channels, f)
+        except Exception as e:
+            pass
 
     @work(exclusive=True, thread=True)
     def load_channels(self) -> None:
@@ -360,6 +393,9 @@ class BotCLI(TextualApp):
             
             self.channels = channels
             self.filtered_channels = channels
+            
+            self.save_channels_to_cache(channels)
+            
             self.call_from_thread(
                 self.update_status,
                 f"✓ Loaded {len(channels)} channels. Start typing to search.",
@@ -635,12 +671,28 @@ class BotCLI(TextualApp):
                             messages_display.write("No messages found in this channel.")
                             return
                         
+                        channel_cache = {ch.get('id'): ch.get('name') for ch in self.channels}
+                        
                         for msg in reversed(messages):
-                            user_id = msg.get("user", "Unknown")
-                            text = msg.get("text", "")
-                            
-                            user_name = self.user_cache.get(user_id, user_id)
-                            messages_display.write(f"[bold cyan]{user_name}[/]: {text}")
+                            try:
+                                user_id = msg.get("user", "Unknown")
+                                text = msg.get("text", "")
+                                
+                                user_name = self.user_cache.get(user_id, user_id)
+                                formatted_text = parse_slack_formatting(text, self.user_cache, channel_cache)
+                                
+                                lines = formatted_text.split('\n')
+                                if len(lines) > 1:
+                                    padded_text = lines[0]
+                                    padding = ' ' * (len(user_name) + 2)
+                                    for line in lines[1:]:
+                                        padded_text += '\n' + padding + line
+                                    formatted_text = padded_text
+                                
+                                messages_display.write(f"[bold cyan]{user_name}[/]: {formatted_text}")
+                            except Exception as e:
+                                user_name = self.user_cache.get(user_id, user_id)
+                                messages_display.write(f"[bold cyan]{user_name}[/]: {text}")
                     except Exception as e:
                         pass
                 
@@ -694,10 +746,12 @@ class BotCLI(TextualApp):
                     return
             
             self.call_from_thread(self.update_status, "Sending message...", "loading")
+            formatted_message = format_user_input(message)
+            formatted_message = resolve_mentions_in_message(formatted_message, self.user_cache)
             
             result = self.slack_app.client.chat_postMessage(
                 channel=self.selected_channel_id,
-                text=message
+                text=formatted_message
             )
             
             if result["ok"]:
