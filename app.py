@@ -42,4 +42,14 @@ def action_button_click(body, ack, say):
 
 # Start your app
 if __name__ == "__main__":
+    channel_id = "C09T0J1578V"
+    try:
+        result = app.client.conversations_join(channel=channel_id)
+        if result["ok"]:
+            print(f"Successfully joined channel {channel_id}")
+        else:
+            print(f"Failed to join channel {channel_id}: {result.get('error', 'Unknown error')}")
+    except Exception as e:
+        print(f"Error joining channel {channel_id}: {e}")
+    
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
