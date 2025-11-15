@@ -40,8 +40,43 @@ def action_button_click(body, ack, say):
     say(f"<@{body['user']['id']}> clicked the button")
 
 
+def get_all_public_channels():
+    channels = []
+    cursor = None
+    
+    while True:
+        try:
+            result = app.client.conversations_list(
+                types="public_channel",
+                cursor=cursor,
+                limit=200
+            )
+            
+            if not result["ok"]:
+                print(f"Error fetching channels: {result.get('error', 'Unknown error')}")
+                break
+            
+            channels.extend(result["channels"])
+            
+            cursor = result.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+                
+        except Exception as e:
+            print(f"Error getting channels: {e}")
+            break
+    
+    return channels
+
+
 # Start your app
 if __name__ == "__main__":
+    public_channels = get_all_public_channels()
+    print(f"Found {len(public_channels)} public channels")
+    for channel in public_channels:
+        print(f"  - {channel['name']} ({channel['id']})")
+    
+    print(public_channels)
     channel_id = "C09T0J1578V"
     try:
         result = app.client.conversations_join(channel=channel_id)
