@@ -1,6 +1,8 @@
 
 import os
+import re
 import time
+import json
 from typing import Optional
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -14,6 +16,12 @@ from textual import work
 
 load_dotenv()
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(SCRIPT_DIR, ".cache")
+CHANNELS_CACHE_FILE = os.path.join(CACHE_DIR, "channels_cache.json")
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 
 class ChannelLabel(Label):
     def __init__(self, channel_name: str, channel_id: str):
@@ -24,6 +32,17 @@ class ChannelLabel(Label):
     
     def on_click(self) -> None:
         self.post_message(ChannelSelected(self.channel_id, self.channel_name))
+
+
+class MemberLabel(Label):
+    def __init__(self, user_name: str, user_id: str):
+        super().__init__()
+        self.user_name = user_name
+        self.user_id = user_id
+        self.update(f"@{user_name}")
+    
+    def on_click(self) -> None:
+        self.post_message(MemberSelected(self.user_id, self.user_name))
 
 
 class ChannelSelected(Message):    
@@ -54,6 +73,13 @@ class CustomFooter(Footer):
 
 class QuitRequested(Message):
     ...
+
+
+class MemberSelected(Message):
+    def __init__(self, user_id: str, user_name: str):
+        super().__init__()
+        self.user_id = user_id
+        self.user_name = user_name
 
 
 class BotCLI(TextualApp):
@@ -205,6 +231,24 @@ class BotCLI(TextualApp):
     #join_channel_button {
         width: 25;
     }
+    
+    #members_container {
+        width: 80;
+        height: 10;
+        border: solid $accent;
+        margin-bottom: 1;
+        padding: 1;
+        display: none;
+    }
+    
+    #members_container.visible {
+        display: block;
+    }
+    
+    #members_list {
+        height: auto;
+        width: 100%;
+    }
     """
 
     BINDINGS = [
@@ -225,6 +269,13 @@ class BotCLI(TextualApp):
         self.selected_channel_name: Optional[str] = None
         self.user_cache: dict[str, str] = {}
         self.refresh_messages_task = None
+        self.last_message_ts: Optional[str] = None
+        self.channel_members: dict[str, list[dict]] = {}
+        self.member_labels: list[MemberLabel] = []
+        self.member_selected_index: int = 0
+        self.mention_at_position: int = 0
+        self.channels_loaded: bool = False
+        self.refresh_channels_task = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -277,14 +328,57 @@ class BotCLI(TextualApp):
         except Exception as e:
             self.update_status(f"Error initializing Slack: {e}", "error")
             return False
+    
+    def save_channels_cache(self) -> None:
+        try:
+            with open(CHANNELS_CACHE_FILE, 'w') as f:
+                json.dump(self.channels, f, indent=2)
+        except Exception:
+            pass
+    
+    def load_channels_cache(self) -> bool:
+        try:
+            if os.path.exists(CHANNELS_CACHE_FILE):
+                with open(CHANNELS_CACHE_FILE, 'r') as f:
+                    self.channels = json.load(f)
+                    self.filtered_channels = self.channels
+                    return True
+        except Exception:
+            pass
+        return False
 
+    @work(exclusive=True, thread=True)
+    def refresh_channels_loop(self) -> None:
+        while True:
+            time.sleep(30)
+            if self.slack_app and self.channels_loaded:
+                self._fetch_channels_impl()
+    
     @work(exclusive=True, thread=True)
     def load_channels(self) -> None:
         if not self.slack_app:
             self.call_from_thread(self.update_status, "Slack app not initialized", "error")
             return
         
-        self.call_from_thread(self.update_status, "Loading channels...", "loading")
+        if self.load_channels_cache():
+            self.channels_loaded = True
+            self.call_from_thread(
+                self.update_status,
+                f"✓ Loaded {len(self.channels)} channels from cache. Updating...",
+                "success"
+            )
+            self.call_from_thread(self.update_suggestions, "")
+        else:
+            self.call_from_thread(self.update_status, "Loading channels...", "loading")
+        
+        self._fetch_channels_impl()
+        
+        if not self.refresh_channels_task:
+            self.refresh_channels_task = self.refresh_channels_loop()
+    
+    def _fetch_channels_impl(self) -> None:
+        if not self.slack_app:
+            return
         
         try:
             channels = []
@@ -305,27 +399,28 @@ class BotCLI(TextualApp):
                         # Handle rate limiting
                         if error_msg == "ratelimited":
                             retry_after = int(result.get("headers", {}).get("Retry-After", 1))
-                            self.call_from_thread(
-                                self.update_status,
-                                f"Rate limited. Waiting {retry_after}s... (Loaded {len(channels)} so far)",
-                                "loading"
-                            )
+                            if not self.channels_loaded:
+                                self.call_from_thread(
+                                    self.update_status,
+                                    f"Rate limited. Waiting {retry_after}s... (Loaded {len(channels)} so far)",
+                                    "loading"
+                                )
                             time.sleep(retry_after)
                             continue
                         
-                        self.call_from_thread(
-                            self.update_status,
-                            f"Error fetching channels: {error_msg} (Loaded {len(channels)} so far)",
-                            "error"
-                        )
+                        if not self.channels_loaded:
+                            self.call_from_thread(
+                                self.update_status,
+                                f"Error fetching channels: {error_msg} (Loaded {len(channels)} so far)",
+                                "error"
+                            )
                         break
                     
                     batch = result.get("channels", [])
                     channels.extend(batch)
                     page_count += 1
                     
-                    # Update progress every 10 pages
-                    if page_count % 10 == 0:
+                    if not self.channels_loaded and page_count % 10 == 0:
                         self.call_from_thread(
                             self.update_status,
                             f"Loading channels... ({len(channels)} loaded so far)",
@@ -342,38 +437,50 @@ class BotCLI(TextualApp):
                     # Log error but continue if we have channels
                     error_msg = str(e)
                     if "ratelimited" in error_msg.lower() or "rate limit" in error_msg.lower():
-                        self.call_from_thread(
-                            self.update_status,
-                            f"Rate limited. Waiting... (Loaded {len(channels)} so far)",
-                            "loading"
-                        )
+                        if not self.channels_loaded:
+                            self.call_from_thread(
+                                self.update_status,
+                                f"Rate limited. Waiting... (Loaded {len(channels)} so far)",
+                                "loading"
+                            )
                         time.sleep(2)
                         continue
                     
                     # For other errors, log and break
-                    self.call_from_thread(
-                        self.update_status,
-                        f"Error: {error_msg} (Loaded {len(channels)} channels before error)",
-                        "error"
-                    )
+                    if not self.channels_loaded:
+                        self.call_from_thread(
+                            self.update_status,
+                            f"Error: {error_msg} (Loaded {len(channels)} channels before error)",
+                            "error"
+                        )
                     break
             
             self.channels = channels
             self.filtered_channels = channels
-            self.call_from_thread(
-                self.update_status,
-                f"✓ Loaded {len(channels)} channels. Start typing to search.",
-                "success"
-            )
+            self.save_channels_cache()
             
-            self.call_from_thread(self.update_suggestions, "")
-            
+            if not self.channels_loaded:
+                self.channels_loaded = True
+                self.call_from_thread(
+                    self.update_status,
+                    f"✓ Loaded {len(channels)} channels. Start typing to search.",
+                    "success"
+                )
+                self.call_from_thread(self.update_suggestions, "")
+            else:
+                self.call_from_thread(
+                    self.update_status,
+                    f"✓ Updated {len(channels)} channels",
+                    "success"
+                )
+             
         except Exception as e:
-            self.call_from_thread(
-                self.update_status,
-                f"Error loading channels: {e}",
-                "error"
-            )
+            if not self.channels_loaded:
+                self.call_from_thread(
+                    self.update_status,
+                    f"Error loading channels: {e}",
+                    "error"
+                )
 
     def update_status(self, message: str, status_type: str = "") -> None:
         status_widget = self.query_one("#status_text", Static)
@@ -422,6 +529,73 @@ class BotCLI(TextualApp):
                 label.scroll_visible()
             else:
                 label.remove_class("--highlight")
+    
+    def update_member_suggestions(self, query: str, at_position: int) -> None:
+        self.mention_at_position = at_position
+        
+        if not self.selected_channel_id or self.selected_channel_id not in self.channel_members:
+            self.load_channel_members(self.selected_channel_id)
+            return
+        
+        members = self.channel_members.get(self.selected_channel_id, [])
+        query_lower = query.lower()
+        
+        filtered_members = [
+            m for m in members
+            if query_lower in m.get('name', '').lower()
+        ][:10]
+        
+        try:
+            members_container = self.query_one("#members_container", ScrollableContainer)
+        except:
+            try:
+                message_input = self.query_one("#message_input", Input)
+                message_container = self.query_one("#message_container", Vertical)
+                members_container = ScrollableContainer(id="members_container")
+                members_list = Vertical(id="members_list")
+                message_container.mount(members_container, before=message_input)
+                members_container.mount(members_list)
+            except:
+                return
+        
+        try:
+            members_list = self.query_one("#members_list", Vertical)
+        except:
+            return
+        
+        for label in self.member_labels:
+            label.remove()
+        self.member_labels.clear()
+        
+        for member in filtered_members:
+            label = MemberLabel(member['name'], member['id'])
+            label.styles.padding = (0, 1)
+            label.styles.height = 1
+            self.member_labels.append(label)
+            members_list.mount(label)
+        
+        if filtered_members:
+            members_container.add_class("visible")
+            self.member_selected_index = 0
+            self.highlight_member_suggestion()
+        else:
+            members_container.remove_class("visible")
+    
+    def hide_member_suggestions(self) -> None:
+        try:
+            members_container = self.query_one("#members_container", ScrollableContainer)
+            members_container.remove_class("visible")
+        except:
+            pass
+        self.member_labels.clear()
+    
+    def highlight_member_suggestion(self) -> None:
+        for i, label in enumerate(self.member_labels):
+            if i == self.member_selected_index:
+                label.add_class("--highlight")
+                label.scroll_visible()
+            else:
+                label.remove_class("--highlight")
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "channel_input":
@@ -429,6 +603,15 @@ class BotCLI(TextualApp):
             self.update_suggestions(query)
             self.selected_index = 0
             self.highlight_suggestion()
+        elif event.input.id == "message_input":
+            text = event.value
+            last_word_start = text.rfind('@')
+            if last_word_start != -1 and last_word_start < len(text) - 1:
+                query = text[last_word_start + 1:]
+                if ' ' not in query:
+                    self.update_member_suggestions(query, last_word_start)
+            else:
+                self.hide_member_suggestions()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "message_input":
@@ -466,6 +649,22 @@ class BotCLI(TextualApp):
 
     def on_channel_selected(self, event: ChannelSelected) -> None:
         self.handle_channel_selection(event.channel_id, event.channel_name)
+    
+    def on_member_selected(self, event: MemberSelected) -> None:
+        try:
+            message_input = self.query_one("#message_input", Input)
+            current_text = message_input.value
+            
+            before_mention = current_text[:self.mention_at_position]
+            mention_text = f"<@{event.user_id}>"
+            after_mention = " "
+            
+            message_input.value = before_mention + mention_text + after_mention
+            message_input.cursor_position = len(before_mention + mention_text + after_mention)
+            
+            self.hide_member_suggestions()
+        except Exception as e:
+            pass
 
     def handle_channel_selection(self, channel_id: str, channel_name: str) -> None:
         self.selected_channel_id = channel_id
@@ -493,6 +692,7 @@ class BotCLI(TextualApp):
         )
         
         self.load_messages(channel_id)
+        self.load_channel_members(channel_id)
         
         message_input = self.query_one("#message_input", Input)
         message_input.focus()
@@ -554,6 +754,90 @@ class BotCLI(TextualApp):
         except Exception as e:
             self.user_cache[user_id] = user_id
             return user_id
+    
+    def resolve_mentions_in_text(self, text: str) -> str:
+        def replace_mention(match):
+            user_id = match.group(1)
+            user_name = self.resolve_user_name(user_id)
+            return f"[yellow]@{user_name}[/yellow]"
+        
+        return re.sub(r'<@([A-Z0-9]+)>', replace_mention, text)
+    
+    def resolve_links_in_text(self, text: str) -> str:
+        def replace_link(match):
+            url = match.group(1)
+            display_text = match.group(2) if match.group(2) else url
+            return f"[blue link={url}]{display_text}[/blue link]"
+        
+        return re.sub(r'<([^|>]+)\|([^>]*)>', replace_link, text)
+    
+    def resolve_formatting(self, text: str) -> str:
+        # Code blocks
+        text = re.sub(r'```(.*?)```', r'[dim]\1[/dim]', text, flags=re.DOTALL)
+        
+        # Inline code
+        text = re.sub(r'`([^`]+)`', r'[code]\1[/code]', text)
+        
+        # Bold
+        text = re.sub(r'\*([^*]+)\*', r'[bold]\1[/bold]', text)
+        
+        # Italic
+        text = re.sub(r'_([^_]+)_', r'[italic]\1[/italic]', text)
+        
+        # Strikethrough
+        text = re.sub(r'~([^~]+)~', r'[strike]\1[/strike]', text)
+        
+        return text
+    
+    def resolve_text(self, text: str) -> str:
+        text = self.resolve_mentions_in_text(text)
+        text = self.resolve_links_in_text(text)
+        text = self.resolve_formatting(text)
+        return text
+    
+    def indent_multiline_text(self, text: str, indent_width: int) -> str:
+        lines = text.split('\n')
+        if len(lines) <= 1:
+            return text
+        
+        indent = ' ' * indent_width
+        return lines[0] + '\n' + '\n'.join(indent + line for line in lines[1:])
+    
+    @work(exclusive=True, thread=True)
+    def load_channel_members(self, channel_id: str) -> None:
+        if not self.slack_app or channel_id in self.channel_members:
+            return
+        
+        try:
+            members = []
+            cursor = None
+            
+            while True:
+                result = self.slack_app.client.conversations_members(
+                    channel=channel_id,
+                    cursor=cursor,
+                    limit=200
+                )
+                
+                if not result.get("ok"):
+                    break
+                
+                batch = result.get("members", [])
+                members.extend(batch)
+                
+                response_metadata = result.get("response_metadata", {})
+                cursor = response_metadata.get("next_cursor")
+                if not cursor or cursor == "":
+                    break
+            
+            member_list = []
+            for user_id in members:
+                user_name = self.resolve_user_name(user_id)
+                member_list.append({"id": user_id, "name": user_name})
+            
+            self.channel_members[channel_id] = member_list
+        except Exception:
+            pass
     
     def load_messages_impl(self, channel_id: str) -> None:
         if not self.slack_app:
@@ -629,18 +913,42 @@ class BotCLI(TextualApp):
                 def display_messages():
                     try:
                         messages_display = self.query_one("#messages_display", RichLog)
-                        messages_display.clear()
                         
-                        if not messages:
-                            messages_display.write("No messages found in this channel.")
-                            return
-                        
-                        for msg in reversed(messages):
-                            user_id = msg.get("user", "Unknown")
-                            text = msg.get("text", "")
+                        # Initial load: clear and display all messages
+                        if self.last_message_ts is None:
+                            messages_display.clear()
                             
-                            user_name = self.user_cache.get(user_id, user_id)
-                            messages_display.write(f"[bold cyan]{user_name}[/]: {text}")
+                            if not messages:
+                                messages_display.write("No messages found in this channel.")
+                                if messages:
+                                    self.last_message_ts = messages[0].get("ts")
+                                return
+                            
+                            for msg in reversed(messages):
+                                user_id = msg.get("user", "Unknown")
+                                text = msg.get("text", "")
+                                text = self.resolve_text(text)
+                                
+                                user_name = self.user_cache.get(user_id, user_id)
+                                indent_width = len(user_name) + 2  # username + ": "
+                                text = self.indent_multiline_text(text, indent_width)
+                                messages_display.write(f"[bold cyan]{user_name}[/]: {text}")
+                            
+                            if messages:
+                                self.last_message_ts = messages[0].get("ts")
+                        else:
+                            # Only append new messages
+                            for msg in reversed(messages):
+                                msg_ts = msg.get("ts")
+                                if msg_ts and msg_ts > self.last_message_ts:
+                                    user_id = msg.get("user", "Unknown")
+                                    text = msg.get("text", "")
+                                    text = self.resolve_text(text)
+                                    user_name = self.user_cache.get(user_id, user_id)
+                                    indent_width = len(user_name) + 2  # username + ": "
+                                    text = self.indent_multiline_text(text, indent_width)
+                                    messages_display.write(f"[bold cyan]{user_name}[/]: {text}")
+                                    self.last_message_ts = msg_ts
                     except Exception as e:
                         pass
                 
@@ -790,6 +1098,7 @@ class BotCLI(TextualApp):
     
     def return_to_channel_selection(self) -> None:
         self.selected_channel_id = None
+        self.last_message_ts = None
         
         try:
             message_container = self.query_one("#message_container", Vertical)
