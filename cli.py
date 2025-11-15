@@ -89,7 +89,7 @@ class BotCLI(TextualApp):
     
     #suggestions_container {
         width: 80;
-        max-height: 20;
+        height: 20;
         border: solid $primary;
         margin-top: 1;
         padding: 1;
@@ -101,7 +101,8 @@ class BotCLI(TextualApp):
     }
     
     #suggestions_list {
-        height: 100%;
+        height: auto;
+        width: 100%;
     }
     
     ChannelLabel {
@@ -192,6 +193,18 @@ class BotCLI(TextualApp):
         width: 20;
         align: center middle;
     }
+    
+    #join_container {
+        height: 20;
+        width: 80;
+        layout: vertical;
+        align: center middle;
+        content-align: center middle;
+    }
+    
+    #join_channel_button {
+        width: 25;
+    }
     """
 
     BINDINGS = [
@@ -227,7 +240,7 @@ class BotCLI(TextualApp):
                     id="channel_input"
                 )
                 
-                with Container(id="suggestions_container"):
+                with ScrollableContainer(id="suggestions_container"):
                     with Vertical(id="suggestions_list"):
                         ...
                 
@@ -370,7 +383,7 @@ class BotCLI(TextualApp):
             status_widget.add_class(status_type)
 
     def update_suggestions(self, query: str) -> None:
-        suggestions_container = self.query_one("#suggestions_container", Container)
+        suggestions_container = self.query_one("#suggestions_container", ScrollableContainer)
         suggestions_list = self.query_one("#suggestions_list", Vertical)
         
         query_lower = query.lower().lstrip('#')
@@ -387,7 +400,7 @@ class BotCLI(TextualApp):
             label.remove()
         self.suggestion_labels.clear()
         
-        for channel in self.filtered_channels[:10]:  
+        for channel in self.filtered_channels[:50]:  
             channel_name = channel.get('name', '')
             channel_id = channel.get('id', '')
             label = ChannelLabel(channel_name, channel_id)
@@ -406,6 +419,7 @@ class BotCLI(TextualApp):
         for i, label in enumerate(self.suggestion_labels):
             if i == self.selected_index:
                 label.add_class("--highlight")
+                label.scroll_visible()
             else:
                 label.remove_class("--highlight")
 
@@ -513,11 +527,85 @@ class BotCLI(TextualApp):
         self.load_messages_impl(channel_id)
         self.refresh_messages_task = self.refresh_messages_loop(channel_id)
     
+    def resolve_user_name(self, user_id: str) -> str:
+        if user_id in self.user_cache:
+            return self.user_cache[user_id]
+        
+        if not self.slack_app:
+            self.user_cache[user_id] = user_id
+            return user_id
+        
+        try:
+            result = self.slack_app.client.users_info(user=user_id)
+            if result.get("ok"):
+                user = result.get("user", {})
+                display_name = (
+                    user.get("real_name") or 
+                    user.get("profile", {}).get("real_name") or
+                    user.get("profile", {}).get("display_name") or
+                    user.get("name") or 
+                    user_id
+                )
+                self.user_cache[user_id] = display_name
+                return display_name
+            else:
+                self.user_cache[user_id] = user_id
+                return user_id
+        except Exception as e:
+            self.user_cache[user_id] = user_id
+            return user_id
+    
     def load_messages_impl(self, channel_id: str) -> None:
         if not self.slack_app:
             return
         
         try:
+            self.call_from_thread(self.update_status, "Checking channel membership...", "loading")
+            
+            membership_result = self.slack_app.client.conversations_info(
+                channel=channel_id
+            )
+            
+            is_member = membership_result.get("channel", {}).get("is_member", False)
+            
+            if not is_member:
+                def show_join_button():
+                    try:
+                        messages_display = self.query_one("#messages_display", RichLog)
+                        messages_display.clear()
+                        messages_display.write("Bot is not a member of this channel.")
+                    except Exception:
+                        pass
+                    
+                    try:
+                        try:
+                            old_input = self.query_one("#message_input", Input)
+                            old_input.remove()
+                        except Exception:
+                            pass
+                        
+                        try:
+                            old_container = self.query_one("#join_container", Container)
+                            old_container.remove()
+                        except Exception:
+                            pass
+                        
+                        message_container = self.query_one("#message_container", Vertical)
+                        join_container = Vertical(id="join_container")
+                        join_btn = Button("Join Channel", id="join_channel_button", variant="primary")
+                        message_container.mount(join_container)
+                        join_container.mount(join_btn)
+                    except Exception:
+                        pass
+                
+                self.call_from_thread(show_join_button)
+                self.call_from_thread(
+                    self.update_status,
+                    "Bot is not a member. Click 'Join Channel' button.",
+                    "error"
+                )
+                return
+            
             self.call_from_thread(self.update_status, "Loading messages...", "loading")
             
             result = self.slack_app.client.conversations_history(
@@ -529,50 +617,14 @@ class BotCLI(TextualApp):
                 messages = result.get("messages", [])
                 user_ids = set()
                 for msg in messages:
-                    if "user" in msg:
-                        user_ids.add(msg["user"])
+                    user_id = msg.get("user")
+                    if user_id:
+                        user_ids.add(user_id)
                 
-                if user_ids:
-                    try:
-                        all_users = []
-                        cursor = None
-                        while True:
-                            users_result = self.slack_app.client.users_list(cursor=cursor, limit=200)
-                            if users_result["ok"]:
-                                all_users.extend(users_result.get("members", []))
-                                cursor = users_result.get("response_metadata", {}).get("next_cursor")
-                                if not cursor:
-                                    break
-                            else:
-                                error = users_result.get("error", "unknown")
-                                self.call_from_thread(
-                                    self.update_status,
-                                    f"Warning: Cannot fetch users - {error}",
-                                    "error"
-                                )
-                                break
-                        
-                        user_map = {}
-                        for u in all_users:
-                            user_id = u.get("id", "")
-                            display_name = (
-                                u.get("real_name") or 
-                                u.get("profile", {}).get("real_name") or
-                                u.get("profile", {}).get("display_name") or
-                                u.get("name") or 
-                                user_id
-                            )
-                            user_map[user_id] = display_name
-                        for user_id in user_ids:
-                            self.user_cache[user_id] = user_map.get(user_id, user_id)
-                    except Exception as e:
-                        self.call_from_thread(
-                            self.update_status,
-                            f"Error fetching users: {e}",
-                            "error"
-                        )
-                        for user_id in user_ids:
-                            self.user_cache[user_id] = user_id
+                # Resolve user names for all users
+                for user_id in user_ids:
+                    if user_id not in self.user_cache:
+                        self.resolve_user_name(user_id)
                 
                 def display_messages():
                     try:
@@ -675,6 +727,66 @@ class BotCLI(TextualApp):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "back_button":
             self.return_to_channel_selection()
+        elif event.button.id == "join_channel_button":
+            self.join_channel()
+    
+    @work(exclusive=True, thread=True)
+    def join_channel(self) -> None:
+        if not self.slack_app or not self.selected_channel_id:
+            self.call_from_thread(self.update_status, "Error: No channel selected", "error")
+            return
+        
+        self.call_from_thread(self.update_status, "Joining channel...", "loading")
+        
+        try:
+            result = self.slack_app.client.conversations_join(
+                channel=self.selected_channel_id
+            )
+            
+            if result["ok"]:
+                def clean_ui():
+                    try:
+                        join_container = self.query_one("#join_container", Vertical)
+                        join_container.remove()
+                    except Exception:
+                        pass
+                    
+                    try:
+                        # Try to focus existing message input or create new one
+                        try:
+                            message_input = self.query_one("#message_input", Input)
+                            message_input.focus()
+                        except:
+                            # If doesn't exist, create it
+                            message_container = self.query_one("#message_container", Vertical)
+                            message_input = Input(placeholder="Type your message...", id="message_input")
+                            # Insert before back button
+                            try:
+                                back_btn = self.query_one("#back_button", Button)
+                                message_container.mount(message_input, before=back_btn)
+                            except:
+                                message_container.mount(message_input)
+                            message_input.focus()
+                    except Exception as e:
+                        pass
+                
+                self.call_from_thread(clean_ui)
+                self.call_from_thread(self.update_status, "Joined! Loading messages...", "loading")
+                # Reload messages now that bot is a member
+                self.load_messages_impl(self.selected_channel_id)
+            else:
+                error_msg = result.get('error', 'Unknown error')
+                self.call_from_thread(
+                    self.update_status,
+                    f"Failed to join channel: {error_msg}",
+                    "error"
+                )
+        except Exception as e:
+            self.call_from_thread(
+                self.update_status,
+                f"Error joining channel: {e}",
+                "error"
+            )
     
     def return_to_channel_selection(self) -> None:
         self.selected_channel_id = None
