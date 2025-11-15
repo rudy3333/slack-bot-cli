@@ -1,6 +1,6 @@
 {
   "display_information": {
-    "name": "bot-cli"
+    "name": "do it"
   },
   "features": {
     "app_home": {
@@ -9,7 +9,7 @@
       "messages_tab_read_only_enabled": false
     },
     "bot_user": {
-      "display_name": "bot-cli",
+      "display_name": "do it",
       "always_online": true
     }
   },

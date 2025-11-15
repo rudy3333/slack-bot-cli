@@ -256,6 +256,7 @@ class BotCLI(TextualApp):
         Binding("tab", "select_first_suggestion", "Select First"),
         Binding("up", "navigate_up", "Up"),
         Binding("down", "navigate_down", "Down"),
+        Binding("s", "show_settings", "Settings"),
     ]
 
     def __init__(self):
@@ -726,16 +727,7 @@ class BotCLI(TextualApp):
     @work(exclusive=True, thread=True)
     def refresh_messages_loop(self, channel_id: str) -> None:
         while self.selected_channel_id == channel_id:
-            if self.slack_app:
-                try:
-                    membership_result = self.slack_app.client.conversations_info(
-                        channel=channel_id
-                    )
-                    is_member = membership_result.get("channel", {}).get("is_member", False)
-                    if is_member:
-                        self.load_messages_impl(channel_id, show_join_ui=False)
-                except Exception:
-                    pass
+            self.load_messages_impl(channel_id)
             time.sleep(1)
     
     @work(exclusive=True, thread=True)
@@ -771,12 +763,6 @@ class BotCLI(TextualApp):
             self.user_cache[user_id] = user_id
             return user_id
     
-    def resolve_channel_name(self, channel_id: str) -> str:
-        for channel in self.channels:
-            if channel.get('id') == channel_id:
-                return channel.get('name', channel_id)
-        return channel_id
-    
     def resolve_mentions_in_text(self, text: str) -> str:
         def replace_mention(match):
             user_id = match.group(1)
@@ -784,20 +770,6 @@ class BotCLI(TextualApp):
             return f"[yellow]@{user_name}[/yellow]"
         
         return re.sub(r'<@([A-Z0-9]+)>', replace_mention, text)
-    
-    def resolve_channel_mentions_in_text(self, text: str) -> str:
-        def replace_channel_mention(match):
-            channel_id = match.group(1)
-            display_name = match.group(2) if match.group(2) else None
-            
-            if display_name:
-                channel_name = display_name
-            else:
-                channel_name = self.resolve_channel_name(channel_id)
-            
-            return f"[blue]#{channel_name}[/blue]"
-        
-        return re.sub(r'<#([A-Z0-9]+)\|?([^>]*)>', replace_channel_mention, text)
     
     def resolve_links_in_text(self, text: str) -> str:
         def replace_link(match):
@@ -827,7 +799,6 @@ class BotCLI(TextualApp):
     
     def resolve_text(self, text: str) -> str:
         text = self.resolve_mentions_in_text(text)
-        text = self.resolve_channel_mentions_in_text(text)
         text = self.resolve_links_in_text(text)
         text = self.resolve_formatting(text)
         return text
@@ -886,7 +857,7 @@ class BotCLI(TextualApp):
         except Exception:
             pass
     
-    def load_messages_impl(self, channel_id: str, show_join_ui: bool = True) -> None:
+    def load_messages_impl(self, channel_id: str) -> None:
         if not self.slack_app:
             return
         
@@ -900,42 +871,41 @@ class BotCLI(TextualApp):
             is_member = membership_result.get("channel", {}).get("is_member", False)
             
             if not is_member:
-                if show_join_ui:
-                    def show_join_button():
+                def show_join_button():
+                    try:
+                        messages_display = self.query_one("#messages_display", RichLog)
+                        messages_display.clear()
+                        messages_display.write("Bot is not a member of this channel.")
+                    except Exception:
+                        pass
+                    
+                    try:
                         try:
-                            messages_display = self.query_one("#messages_display", RichLog)
-                            messages_display.clear()
-                            messages_display.write("Bot is not a member of this channel.")
+                            old_input = self.query_one("#message_input", Input)
+                            old_input.remove()
                         except Exception:
                             pass
                         
                         try:
-                            try:
-                                old_input = self.query_one("#message_input", Input)
-                                old_input.remove()
-                            except Exception:
-                                pass
-                            
-                            try:
-                                old_container = self.query_one("#join_container", Container)
-                                old_container.remove()
-                            except Exception:
-                                pass
-                            
-                            message_container = self.query_one("#message_container", Vertical)
-                            join_container = Vertical(id="join_container")
-                            join_btn = Button("Join Channel", id="join_channel_button", variant="primary")
-                            message_container.mount(join_container)
-                            join_container.mount(join_btn)
+                            old_container = self.query_one("#join_container", Container)
+                            old_container.remove()
                         except Exception:
                             pass
-                    
-                    self.call_from_thread(show_join_button)
-                    self.call_from_thread(
-                        self.update_status,
-                        "Bot is not a member. Click 'Join Channel' button.",
-                        "error"
-                    )
+                        
+                        message_container = self.query_one("#message_container", Vertical)
+                        join_container = Vertical(id="join_container")
+                        join_btn = Button("Join Channel", id="join_channel_button", variant="primary")
+                        message_container.mount(join_container)
+                        join_container.mount(join_btn)
+                    except Exception:
+                        pass
+                
+                self.call_from_thread(show_join_button)
+                self.call_from_thread(
+                    self.update_status,
+                    "Bot is not a member. Click 'Join Channel' button.",
+                    "error"
+                )
                 return
             
             self.call_from_thread(self.update_status, "Loading messages...", "loading")
@@ -945,7 +915,7 @@ class BotCLI(TextualApp):
                 limit=100
             )
             
-            if result["ok"]:
+            if result.get("ok"):
                 messages = result.get("messages", [])
                 user_ids = set()
                 for msg in messages:
@@ -972,7 +942,7 @@ class BotCLI(TextualApp):
                                     self.last_message_ts = messages[0].get("ts")
                                 return
                             
-                            for msg in reversed(messages):
+                            for msg in messages:
                                 user_id = msg.get("user", "Unknown")
                                 text = msg.get("text", "")
                                 text = self.resolve_text(text)
@@ -986,7 +956,7 @@ class BotCLI(TextualApp):
                                 self.last_message_ts = messages[0].get("ts")
                         else:
                             # Only append new messages
-                            for msg in reversed(messages):
+                            for msg in messages:
                                 msg_ts = msg.get("ts")
                                 if msg_ts and msg_ts > self.last_message_ts:
                                     user_id = msg.get("user", "Unknown")
@@ -1090,11 +1060,83 @@ class BotCLI(TextualApp):
                 "error"
             )
 
+    def save_appearance_settings(self) -> None:
+        """Save appearance settings from the form."""
+        try:
+            username_input = self.query_one("#username_input", Input)
+            icon_emoji_input = self.query_one("#icon_emoji_input", Input)
+            icon_url_input = self.query_one("#icon_url_input", Input)
+            
+            self.bot_username = username_input.value.strip() or None
+            self.bot_icon_emoji = icon_emoji_input.value.strip() or None
+            self.bot_icon_url = icon_url_input.value.strip() or None
+            
+            self.update_status("Appearance settings saved!", "success")
+            self.return_to_channel_selection()
+        except Exception as e:
+            self.update_status(f"Error saving settings: {e}", "error")
+    
+    def show_appearance_settings(self) -> None:
+        """Display appearance settings in the message area."""
+        try:
+            try:
+                message_container = self.query_one("#message_container", Vertical)
+                message_container.remove()
+            except Exception:
+                pass
+            
+            input_container = self.query_one("#input_container", Vertical)
+            input_container.display = False
+            
+            main_container = self.query_one("#main_container", Container)
+            settings_container = Vertical(id="settings_container")
+            main_container.mount(settings_container)
+            
+            settings_container.mount(
+                Static("Bot Appearance Settings", id="settings_header")
+            )
+            
+            settings_container.mount(
+                Static("Username (leave empty for default):")
+            )
+            settings_container.mount(
+                Input(value=self.bot_username or "", id="username_input", placeholder="e.g., Custom Bot")
+            )
+            
+            settings_container.mount(
+                Static("Icon Emoji (leave empty for default):")
+            )
+            settings_container.mount(
+                Input(value=self.bot_icon_emoji or "", id="icon_emoji_input", placeholder="e.g., :robot_face:")
+            )
+            
+            settings_container.mount(
+                Static("Icon URL (alternative to emoji):")
+            )
+            settings_container.mount(
+                Input(value=self.bot_icon_url or "", id="icon_url_input", placeholder="https://example.com/icon.png")
+            )
+            
+            button_container = Vertical()
+            button_container.mount(
+                Button("Save Settings", id="save_settings_button", variant="primary")
+            )
+            button_container.mount(
+                Button("← Back to Channels", id="back_to_channels_button", variant="default")
+            )
+            settings_container.mount(button_container)
+        except Exception as e:
+            self.update_status(f"Error showing settings: {e}", "error")
+    
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "back_button":
             self.return_to_channel_selection()
         elif event.button.id == "join_channel_button":
             self.join_channel()
+        elif event.button.id == "save_settings_button":
+            self.save_appearance_settings()
+        elif event.button.id == "back_to_channels_button":
+            self.return_to_channel_selection()
     
     @work(exclusive=True, thread=True)
     def join_channel(self) -> None:
