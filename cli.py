@@ -5,9 +5,9 @@ from typing import Optional
 from dotenv import load_dotenv
 from slack_bolt import App
 from textual.app import App as TextualApp, ComposeResult
-from textual.widgets import Header, Footer, Input, Static, Label, Button
+from textual.widgets import Header, Footer, Input, Static, Label, Button, RichLog
 from textual.widgets import Button as TextualButton
-from textual.containers import Container, Vertical
+from textual.containers import Container, Vertical, ScrollableContainer
 from textual.binding import Binding
 from textual.message import Message
 from textual import work
@@ -175,6 +175,13 @@ class BotCLI(TextualApp):
         color: $success;
     }
     
+    #messages_display {
+        height: 20;
+        border: solid $primary;
+        margin-bottom: 1;
+        padding: 1;
+    }
+    
     #message_input {
         width: 100%;
         height: 3;
@@ -203,6 +210,8 @@ class BotCLI(TextualApp):
         self.selected_index: int = 0
         self.selected_channel_id: Optional[str] = None
         self.selected_channel_name: Optional[str] = None
+        self.user_cache: dict[str, str] = {}
+        self.refresh_messages_task = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -458,12 +467,18 @@ class BotCLI(TextualApp):
         message_container.mount(
             Static(f"Sending to: #{channel_name}", id="channel_header")
         )
+        
+        messages_display = RichLog(id="messages_display", highlight=True, markup=True)
+        message_container.mount(messages_display)
+        
         message_container.mount(
             Input(placeholder="Type your message...", id="message_input")
         )
         message_container.mount(
             Button("← Back to Channels", id="back_button", variant="primary")
         )
+        
+        self.load_messages(channel_id)
         
         message_input = self.query_one("#message_input", Input)
         message_input.focus()
@@ -486,6 +501,115 @@ class BotCLI(TextualApp):
         if self.suggestion_labels:
             self.selected_index = min(len(self.suggestion_labels) - 1, self.selected_index + 1)
             self.highlight_suggestion()
+
+    @work(exclusive=True, thread=True)
+    def refresh_messages_loop(self, channel_id: str) -> None:
+        while self.selected_channel_id == channel_id:
+            self.load_messages_impl(channel_id)
+            time.sleep(1)
+    
+    @work(exclusive=True, thread=True)
+    def load_messages(self, channel_id: str) -> None:
+        self.load_messages_impl(channel_id)
+        self.refresh_messages_task = self.refresh_messages_loop(channel_id)
+    
+    def load_messages_impl(self, channel_id: str) -> None:
+        if not self.slack_app:
+            return
+        
+        try:
+            self.call_from_thread(self.update_status, "Loading messages...", "loading")
+            
+            result = self.slack_app.client.conversations_history(
+                channel=channel_id,
+                limit=100
+            )
+            
+            if result["ok"]:
+                messages = result.get("messages", [])
+                user_ids = set()
+                for msg in messages:
+                    if "user" in msg:
+                        user_ids.add(msg["user"])
+                
+                if user_ids:
+                    try:
+                        all_users = []
+                        cursor = None
+                        while True:
+                            users_result = self.slack_app.client.users_list(cursor=cursor, limit=200)
+                            if users_result["ok"]:
+                                all_users.extend(users_result.get("members", []))
+                                cursor = users_result.get("response_metadata", {}).get("next_cursor")
+                                if not cursor:
+                                    break
+                            else:
+                                error = users_result.get("error", "unknown")
+                                self.call_from_thread(
+                                    self.update_status,
+                                    f"Warning: Cannot fetch users - {error}",
+                                    "error"
+                                )
+                                break
+                        
+                        user_map = {}
+                        for u in all_users:
+                            user_id = u.get("id", "")
+                            display_name = (
+                                u.get("real_name") or 
+                                u.get("profile", {}).get("real_name") or
+                                u.get("profile", {}).get("display_name") or
+                                u.get("name") or 
+                                user_id
+                            )
+                            user_map[user_id] = display_name
+                        for user_id in user_ids:
+                            self.user_cache[user_id] = user_map.get(user_id, user_id)
+                    except Exception as e:
+                        self.call_from_thread(
+                            self.update_status,
+                            f"Error fetching users: {e}",
+                            "error"
+                        )
+                        for user_id in user_ids:
+                            self.user_cache[user_id] = user_id
+                
+                def display_messages():
+                    try:
+                        messages_display = self.query_one("#messages_display", RichLog)
+                        messages_display.clear()
+                        
+                        if not messages:
+                            messages_display.write("No messages found in this channel.")
+                            return
+                        
+                        for msg in reversed(messages):
+                            user_id = msg.get("user", "Unknown")
+                            text = msg.get("text", "")
+                            
+                            user_name = self.user_cache.get(user_id, user_id)
+                            messages_display.write(f"[bold cyan]{user_name}[/]: {text}")
+                    except Exception as e:
+                        pass
+                
+                self.call_from_thread(display_messages)
+                self.call_from_thread(
+                    self.update_status,
+                    f"✓ Loaded {len(messages)} messages",
+                    "success"
+                )
+            else:
+                self.call_from_thread(
+                    self.update_status,
+                    "Failed to load messages",
+                    "error"
+                )
+        except Exception as e:
+            self.call_from_thread(
+                self.update_status,
+                f"Error loading messages: {e}",
+                "error"
+            )
 
     @work(exclusive=True, thread=True)
     def send_message(self, message: str) -> None:
@@ -553,6 +677,8 @@ class BotCLI(TextualApp):
             self.return_to_channel_selection()
     
     def return_to_channel_selection(self) -> None:
+        self.selected_channel_id = None
+        
         try:
             message_container = self.query_one("#message_container", Vertical)
             message_container.remove()
@@ -566,7 +692,6 @@ class BotCLI(TextualApp):
         channel_input.value = ""
         channel_input.focus()
         
-        self.selected_channel_id = None
         self.selected_channel_name = None
         
         self.update_status("Select a channel", "success")
