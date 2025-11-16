@@ -574,7 +574,8 @@ class BotCLI(TextualApp):
 
     @work(exclusive=True, thread=True)
     def refresh_messages_loop(self, channel_id: str) -> None:
-        last_update = {}
+        last_message_count = 0
+        last_latest_message = None
         while self.selected_channel_id == channel_id:
             try:
                 result = self.slack_app.client.conversations_history(
@@ -584,9 +585,14 @@ class BotCLI(TextualApp):
                 
                 if result.get("ok"):
                     messages = result.get("messages", [])
-                    if hash(str(messages)) != last_update.get(channel_id):
-                        last_update[channel_id] = hash(str(messages))
-                        self.call_from_thread(self.display_messages_in_ui, messages, channel_id, auto_scroll=False)
+                    current_count = len(messages)
+                    latest = messages[0] if messages else None
+                    latest_ts = latest.get("ts") if latest else None
+                    
+                    if current_count != last_message_count or latest_ts != last_latest_message:
+                        last_message_count = current_count
+                        last_latest_message = latest_ts
+                        self.call_from_thread(self.display_messages_in_ui, messages, channel_id, auto_scroll=True)
             except Exception as e:
                 pass
             time.sleep(2)
