@@ -5,7 +5,11 @@ terminal UI for browsing slack channels and sending messages as a bot.
 
 ## setup
 
-### 1. environment variables
+### 1. create a slack application
+
+create a [slack application](https://api.slack.com/apps) using the following [manifest.json](https://raw.githubusercontent.com/rudy3333/slack-bot-cli/refs/heads/main/manifest.json) file adjust to your liking
+
+### 2. environment variables
 
 create a `.env` file:
 
