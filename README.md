@@ -1,61 +1,29 @@
-# Getting Started ⚡️ Bolt for Python
-> Slack app example from 📚 [Getting started with Bolt for Python][1]
+# slack-bot-cli
 
-## Overview
+terminal UI for browsing slack channels and sending messages as a bot.
 
-This is a Slack app built with the [Bolt for Python framework][2] that showcases
-responding to events and interactive buttons.
 
-## Running locally
+## setup
 
-### 1. Setup environment variables
+### 1. environment variables
 
-```zsh
-# Replace with your tokens
-export SLACK_BOT_TOKEN=<your-bot-token>
-export SLACK_APP_TOKEN=<your-app-level-token>
+create a `.env` file:
+
+```
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
 ```
 
-### 2. Setup your local project
+### 2. install dependencies
 
-```zsh
-# Clone this project onto your machine
-git clone https://github.com/slackapi/bolt-python-getting-started-app.git
-
-# Change into this project
-cd bolt-python-getting-started-app/
-
-# Setup virtual environment
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Install the dependencies
 pip install -r requirements.txt
 ```
 
-### 3. Start servers
-```zsh
-python3 app.py
+### 3. run
+
+```bash
+python3 cli.py
 ```
-
-## More examples
-
-Looking for more examples of Bolt for Python? Browse to [bolt-python/examples/][5] for a long list of usage, server, and deployment code samples!
-
-## Contributing
-
-### Issues and questions
-
-Found a bug or have a question about this project? We'd love to hear from you!
-
-1. Browse to [slackapi/bolt-python/issues][4]
-1. Create a new issue
-1. Mention that you're using this example app
-
-See you there and thanks for helping to improve Bolt for everyone!
-
-[1]: https://slack.dev/bolt-python/tutorial/getting-started
-[2]: https://slack.dev/bolt-python/
-[3]: https://slack.dev/bolt-python/tutorial/getting-started#setting-up-events
-[4]: https://github.com/slackapi/bolt-python/issues/new/choose
-[5]: https://github.com/slackapi/bolt-python/tree/main/examples
