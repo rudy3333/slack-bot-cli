@@ -2,6 +2,7 @@
 import os
 import json
 import time
+import textwrap
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
@@ -184,9 +185,11 @@ class BotCLI(TextualApp):
     
     #messages_display {
         height: 20;
+        width: 80;
         border: solid $primary;
         margin-bottom: 1;
         padding: 1;
+        scrollbar-size: 1 1;
     }
     
     #message_input {
@@ -238,7 +241,7 @@ class BotCLI(TextualApp):
         with Container(id="main_container"):
             with Vertical(id="input_container"):
                 yield Static(
-                    "Enter channel name (type to search, use Tab/Arrow keys to navigate):",
+                    "Enter channel name (type to search, use arrow keys to navigate):",
                     id="input_label"
                 )
                 yield Input(
@@ -264,13 +267,11 @@ class BotCLI(TextualApp):
             if cached_channels:
                 self.channels = cached_channels
                 self.filtered_channels = cached_channels[:20]
-                self.update_status(
-                    f"Loaded {len(cached_channels)} channels from cache. Refreshing...",
-                    "success"
-                )
+                self.update_status(f"{len(cached_channels)} channels loaded from cache", "success")
                 self.update_suggestions("")
-            
-            self.load_channels()
+                self.load_channels(show_loading=False, initial_cache_count=len(cached_channels))
+            else:
+                self.load_channels(show_loading=True)
         else:
             self.update_status(
                 "Failed to initialize Slack. Check SLACK_BOT_TOKEN in .env file.",
@@ -288,7 +289,6 @@ class BotCLI(TextualApp):
                 return False
             
             self.slack_app = App(token=bot_token)
-            self.update_status("Slack app initialized successfully", "success")
             return True
         except Exception as e:
             self.update_status(f"Error initializing Slack: {e}", "error")
@@ -312,12 +312,13 @@ class BotCLI(TextualApp):
             pass
 
     @work(exclusive=True, thread=True)
-    def load_channels(self) -> None:
+    def load_channels(self, show_loading: bool = True, initial_cache_count: int = 0) -> None:
         if not self.slack_app:
             self.call_from_thread(self.update_status, "Slack app not initialized", "error")
             return
         
-        self.call_from_thread(self.update_status, "Loading channels...", "loading")
+        if show_loading:
+            self.call_from_thread(self.update_status, "Loading channels...", "loading")
         
         try:
             channels = []
@@ -338,19 +339,21 @@ class BotCLI(TextualApp):
                         # Handle rate limiting
                         if error_msg == "ratelimited":
                             retry_after = int(result.get("headers", {}).get("Retry-After", 1))
-                            self.call_from_thread(
-                                self.update_status,
-                                f"Rate limited. Waiting {retry_after}s... (Loaded {len(channels)} so far)",
-                                "loading"
-                            )
+                            if show_loading:
+                                self.call_from_thread(
+                                    self.update_status,
+                                    f"Rate limited. Waiting {retry_after}s... (Loaded {len(channels)} so far)",
+                                    "loading"
+                                )
                             time.sleep(retry_after)
                             continue
                         
-                        self.call_from_thread(
-                            self.update_status,
-                            f"Error fetching channels: {error_msg} (Loaded {len(channels)} so far)",
-                            "error"
-                        )
+                        if show_loading:
+                            self.call_from_thread(
+                                self.update_status,
+                                f"Error fetching channels: {error_msg} (Loaded {len(channels)} so far)",
+                                "error"
+                            )
                         break
                     
                     batch = result.get("channels", [])
@@ -358,7 +361,7 @@ class BotCLI(TextualApp):
                     page_count += 1
                     
                     # Update progress every 10 pages
-                    if page_count % 10 == 0:
+                    if show_loading and page_count % 10 == 0:
                         self.call_from_thread(
                             self.update_status,
                             f"Loading channels... ({len(channels)} loaded so far)",
@@ -375,20 +378,22 @@ class BotCLI(TextualApp):
                     # Log error but continue if we have channels
                     error_msg = str(e)
                     if "ratelimited" in error_msg.lower() or "rate limit" in error_msg.lower():
-                        self.call_from_thread(
-                            self.update_status,
-                            f"Rate limited. Waiting... (Loaded {len(channels)} so far)",
-                            "loading"
-                        )
+                        if show_loading:
+                            self.call_from_thread(
+                                self.update_status,
+                                f"Rate limited. Waiting... (Loaded {len(channels)} so far)",
+                                "loading"
+                            )
                         time.sleep(2)
                         continue
                     
                     # For other errors, log and break
-                    self.call_from_thread(
-                        self.update_status,
-                        f"Error: {error_msg} (Loaded {len(channels)} channels before error)",
-                        "error"
-                    )
+                    if show_loading:
+                        self.call_from_thread(
+                            self.update_status,
+                            f"Error: {error_msg} (Loaded {len(channels)} channels before error)",
+                            "error"
+                        )
                     break
             
             self.channels = channels
@@ -396,11 +401,26 @@ class BotCLI(TextualApp):
             
             self.save_channels_to_cache(channels)
             
-            self.call_from_thread(
-                self.update_status,
-                f"✓ Loaded {len(channels)} channels. Start typing to search.",
-                "success"
-            )
+            if show_loading:
+                self.call_from_thread(
+                    self.update_status,
+                    f"Loaded {len(channels)} channels. Start typing to search.",
+                    "success"
+                )
+            else:
+                difference = len(channels) - initial_cache_count
+                if difference >= 0:
+                    self.call_from_thread(
+                        self.update_status,
+                        f"Finished sync. {len(channels)} channels loaded, +{difference} from cache",
+                        "success"
+                    )
+                else:
+                    self.call_from_thread(
+                        self.update_status,
+                        f"Finished sync. {len(channels)} channels loaded, {difference} from cache",
+                        "success"
+                    )
             
             self.call_from_thread(self.update_suggestions, "")
             
@@ -554,15 +574,79 @@ class BotCLI(TextualApp):
 
     @work(exclusive=True, thread=True)
     def refresh_messages_loop(self, channel_id: str) -> None:
+        last_update = {}
         while self.selected_channel_id == channel_id:
-            self.load_messages_impl(channel_id)
-            time.sleep(1)
+            try:
+                result = self.slack_app.client.conversations_history(
+                    channel=channel_id,
+                    limit=100
+                )
+                
+                if result.get("ok"):
+                    messages = result.get("messages", [])
+                    if hash(str(messages)) != last_update.get(channel_id):
+                        last_update[channel_id] = hash(str(messages))
+                        self.call_from_thread(self.display_messages_in_ui, messages, channel_id, auto_scroll=False)
+            except Exception as e:
+                pass
+            time.sleep(2)
     
     @work(exclusive=True, thread=True)
     def load_messages(self, channel_id: str) -> None:
         self.load_messages_impl(channel_id)
         self.refresh_messages_task = self.refresh_messages_loop(channel_id)
     
+    def display_messages_in_ui(self, messages: list, channel_id: str, auto_scroll: bool = True) -> None:
+        try:
+            messages_display = self.query_one("#messages_display", RichLog)
+            
+            if not auto_scroll:
+                scroll_y = messages_display.vertical_scroll
+            
+            messages_display.clear()
+            
+            if not messages:
+                messages_display.write("No messages found in this channel.")
+                return
+            
+            channel_cache = {ch.get('id'): ch.get('name') for ch in self.channels}
+            
+            for msg in reversed(messages):
+                try:
+                    user_id = msg.get("user", "Unknown")
+                    text = msg.get("text", "")
+                    
+                    user_name = self.user_cache.get(user_id, user_id)
+                    formatted_text = parse_slack_formatting(text, self.user_cache, channel_cache)
+                    
+                    lines = formatted_text.split('\n')
+                    padding = ' ' * (len(user_name) + 2)
+                    wrap_width = 75 - len(padding)
+                    
+                    all_wrapped_lines = []
+                    for line in lines:
+                        wrapped = textwrap.wrap(line, width=wrap_width, break_long_words=True)
+                        if wrapped:
+                            all_wrapped_lines.extend(wrapped)
+                        else:
+                            all_wrapped_lines.append("")
+                    
+                    if all_wrapped_lines:
+                        full_message = f"[bold cyan]{user_name}[/]: {all_wrapped_lines[0]}"
+                        for line in all_wrapped_lines[1:]:
+                            full_message += f"\n{padding}{line}"
+                        messages_display.write(full_message)
+                    else:
+                        messages_display.write(f"[bold cyan]{user_name}[/]: ")
+                except Exception as e:
+                    user_name = self.user_cache.get(user_id, user_id)
+                    messages_display.write(f"[bold cyan]{user_name}[/]: {text}")
+            
+            if not auto_scroll:
+                messages_display.vertical_scroll = scroll_y
+        except Exception as e:
+            pass
+
     def resolve_user_name(self, user_id: str) -> str:
         if user_id in self.user_cache:
             return self.user_cache[user_id]
@@ -591,7 +675,7 @@ class BotCLI(TextualApp):
             self.user_cache[user_id] = user_id
             return user_id
     
-    def load_messages_impl(self, channel_id: str) -> None:
+    def load_messages_impl(self, channel_id: str, auto_scroll: bool = True) -> None:
         if not self.slack_app:
             return
         
@@ -662,41 +746,7 @@ class BotCLI(TextualApp):
                     if user_id not in self.user_cache:
                         self.resolve_user_name(user_id)
                 
-                def display_messages():
-                    try:
-                        messages_display = self.query_one("#messages_display", RichLog)
-                        messages_display.clear()
-                        
-                        if not messages:
-                            messages_display.write("No messages found in this channel.")
-                            return
-                        
-                        channel_cache = {ch.get('id'): ch.get('name') for ch in self.channels}
-                        
-                        for msg in reversed(messages):
-                            try:
-                                user_id = msg.get("user", "Unknown")
-                                text = msg.get("text", "")
-                                
-                                user_name = self.user_cache.get(user_id, user_id)
-                                formatted_text = parse_slack_formatting(text, self.user_cache, channel_cache)
-                                
-                                lines = formatted_text.split('\n')
-                                if len(lines) > 1:
-                                    padded_text = lines[0]
-                                    padding = ' ' * (len(user_name) + 2)
-                                    for line in lines[1:]:
-                                        padded_text += '\n' + padding + line
-                                    formatted_text = padded_text
-                                
-                                messages_display.write(f"[bold cyan]{user_name}[/]: {formatted_text}")
-                            except Exception as e:
-                                user_name = self.user_cache.get(user_id, user_id)
-                                messages_display.write(f"[bold cyan]{user_name}[/]: {text}")
-                    except Exception as e:
-                        pass
-                
-                self.call_from_thread(display_messages)
+                self.call_from_thread(self.display_messages_in_ui, messages, channel_id, auto_scroll)
                 self.call_from_thread(
                     self.update_status,
                     f"✓ Loaded {len(messages)} messages",
@@ -844,6 +894,10 @@ class BotCLI(TextualApp):
     
     def return_to_channel_selection(self) -> None:
         self.selected_channel_id = None
+        
+        if self.refresh_messages_task:
+            self.refresh_messages_task.cancel()
+            self.refresh_messages_task = None
         
         try:
             message_container = self.query_one("#message_container", Vertical)
